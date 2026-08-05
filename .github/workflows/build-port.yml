@@ -33,6 +33,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        shell: bash
+
     env:
       OUTPUT_FILE: ${{ inputs.output_file || 'index.html' }}
       MAX_INLINE_FILE_MB: "25"
@@ -54,11 +58,11 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y curl wget unzip zip file python3 python3-pip
+          set -eu
 
-          # gdown is used for Google Drive links.
+          sudo apt-get update
+          sudo apt-get install -y curl wget unzip zip file python3 python3-pip sed
+
           python3 -m pip install --quiet gdown \
             || python3 -m pip install --quiet --break-system-packages gdown \
             || python3 -m pip install --quiet --user --break-system-packages gdown
@@ -66,23 +70,22 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Download mod payload
+        env:
+          MOD_URL: ${{ inputs.mod_url }}
         run: |
-          set -euo pipefail
+          set -eu
 
-          URL="${{ inputs.mod_url }}"
+          URL="$MOD_URL"
           echo "::add-mask::$URL"
 
-          if echo "$URL" | grep -qi "drive.google.com"; then
+          if [[ "$URL" == *"drive.google.com"* ]]; then
             echo "Downloading from Google Drive with gdown..."
             gdown "$URL" -O mod.zip || gdown --fuzzy "$URL" -O mod.zip
           else
             FIXED_URL="$URL"
 
-            # Convert normal Dropbox page links into direct download links.
-            if echo "$FIXED_URL" | grep -qi "dropbox.com"; then
-              FIXED_URL=$(echo "$FIXED_URL" \
-                | sed -e 's/dl=0/dl=1/' \
-                -e 's/www\.dropbox\.com/dl.dropboxusercontent.com/')
+            if [[ "$FIXED_URL" == *"dropbox.com"* ]]; then
+              FIXED_URL=$(echo "$FIXED_URL" | sed -e 's/dl=0/dl=1/' -e 's/www\.dropbox\.com/dl.dropboxusercontent.com/')
             fi
 
             echo "Downloading direct zip..."
@@ -98,7 +101,7 @@ jobs:
 
       - name: Extract and normalize mod payload
         run: |
-          set -euo pipefail
+          set -eu
 
           mkdir -p payload_raw payload
           unzip -q mod.zip -d payload_raw
@@ -108,7 +111,6 @@ jobs:
           shopt -s dotglob nullglob
           entries=(payload_raw/*)
 
-          # If the zip contains one folder, flatten it.
           if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
             echo "Flattening single folder: ${entries[0]}"
             mv "${entries[0]}"/* payload/ 2>/dev/null || true
@@ -120,18 +122,19 @@ jobs:
           rm -rf payload/__MACOSX payload/.git payload/.github || true
 
           echo "Payload preview:"
-          find payload -maxdepth 2 -print | head -n 80
+          find payload -maxdepth 2 -print > payload-preview.txt 2>/dev/null || true
+          sed -n '1,80p' payload-preview.txt || true
+          rm -f payload-preview.txt || true
 
       - name: Inject mod into engine
         run: |
-          set -euo pipefail
+          set -eu
 
           cd engine-source
           mkdir -p mods assets
 
           shopt -s dotglob nullglob
 
-          # If the payload uses standard FNF/Psych folders, inject them directly.
           if [ -d ../payload/mods ]; then
             echo "Injecting payload/mods..."
             cp -rn ../payload/mods/. mods/ || true
@@ -144,7 +147,6 @@ jobs:
             cp -rn ../payload/assets/. mods/ || true
           fi
 
-          # Copy top-level files/folders that are not mods/assets into both locations.
           for item in ../payload/*; do
             base="$(basename "$item")"
 
@@ -157,10 +159,12 @@ jobs:
             cp -rn "$item" assets/ || true
           done
 
-          # If payload had no recognizable structure, the above loop already copied it.
           echo "Injected payload preview:"
-          find mods -maxdepth 2 -print | head -n 40
-          find assets -maxdepth 2 -print | head -n 40
+          find mods -maxdepth 2 -print > mods-preview.txt 2>/dev/null || true
+          find assets -maxdepth 2 -print > assets-preview.txt 2>/dev/null || true
+          sed -n '1,40p' mods-preview.txt || true
+          sed -n '1,40p' assets-preview.txt || true
+          rm -f mods-preview.txt assets-preview.txt || true
 
       - name: Setup Haxe
         uses: krdlab/setup-haxe@v1
@@ -169,29 +173,30 @@ jobs:
 
       - name: Install Haxelibs
         run: |
-          set -euo pipefail
+          set -eu
 
           cd engine-source
 
           haxelib setup ~/haxelib
           haxelib install hmm --always --quiet
 
-          # Prefer the engine's own dependency lockfile if present.
           haxelib run hmm install --quiet || true
 
-          # Fallbacks for common required libs if hmm did not provide them.
+          haxelib list > haxelib-list.txt 2>/dev/null || true
+
           for lib in lime openfl flixel flixel-addons flixel-ui flixel-tools hscript hxcpp; do
-            if ! haxelib list | grep -q "^$lib:"; then
+            if ! grep -q "^$lib:" haxelib-list.txt 2>/dev/null; then
               echo "Installing fallback lib: $lib"
               haxelib install "$lib" --always --quiet || true
             fi
           done
 
+          rm -f haxelib-list.txt || true
           haxelib list
 
       - name: Patch engine for HTML5/web build
         run: |
-          set -euo pipefail
+          set -eu
 
           cd engine-source
 
@@ -488,7 +493,6 @@ jobs:
           typedef DiscordPresence = Dynamic;
           HX
 
-          # Remove desktop/native-only libraries from the project file.
           if [ -f Project.xml ]; then
             sed -i \
               -e '/discord_rpc/d' \
@@ -498,26 +502,23 @@ jobs:
               Project.xml || true
           fi
 
-          # Patch common desktop/sys/native references to web-safe mocks.
-          if [ -d source ]; then
-            find source -name "*.hx" -type f -print0 | xargs -0 sed -i \
-              -e 's/sys\.FileSystem/webmock.FileSystem/g' \
-              -e 's/sys\.io\.File/webmock.File/g' \
-              -e 's/sys\.io\.Process/webmock.Process/g' \
-              -e 's/sys\.thread\.Thread/webmock.Thread/g' \
-              -e 's/sys\.thread\.Mutex/webmock.Mutex/g' \
-              -e 's/\bSys\./webmock.Sys./g' \
-              -e '/import Sys;/d' \
-              -e '/import cpp/d' \
-              -e 's/cpp\.[A-Za-z0-9_\.]+/Dynamic/g' \
-              -e '/import llua/d' \
-              -e 's/llua\.[A-Za-z0-9_\.]+/Dynamic/g' \
-              || true
-          fi
+          find source -name "*.hx" -type f -exec sed -i \
+            -e 's/sys\.FileSystem/webmock.FileSystem/g' \
+            -e 's/sys\.io\.File/webmock.File/g' \
+            -e 's/sys\.io\.Process/webmock.Process/g' \
+            -e 's/sys\.thread\.Thread/webmock.Thread/g' \
+            -e 's/sys\.thread\.Mutex/webmock.Mutex/g' \
+            -e 's/\bSys\./webmock.Sys./g' \
+            -e '/import Sys;/d' \
+            -e '/import cpp/d' \
+            -e 's/cpp\.[A-Za-z0-9_\.]+/Dynamic/g' \
+            -e '/import llua/d' \
+            -e 's/llua\.[A-Za-z0-9_\.]+/Dynamic/g' \
+            {} + || true
 
       - name: Build HTML5
         run: |
-          set -euo pipefail
+          set -eu
 
           cd engine-source
 
@@ -530,7 +531,7 @@ jobs:
 
       - name: Verify HTML5 build output
         run: |
-          set -euo pipefail
+          set -eu
 
           BIN_DIR="engine-source/export/release/html5/bin"
 
@@ -540,11 +541,13 @@ jobs:
           fi
 
           echo "Build output preview:"
-          ls -la "$BIN_DIR" | head -n 80
+          find "$BIN_DIR" -maxdepth 2 -print > build-preview.txt 2>/dev/null || true
+          sed -n '1,80p' build-preview.txt || true
+          rm -f build-preview.txt || true
 
       - name: Generate standalone HTML
         run: |
-          set -euo pipefail
+          set -eu
 
           cat > inline_html.py <<'PY'
           import base64
@@ -649,6 +652,17 @@ jobs:
 
               return path
 
+          def find_attr(tag, attr):
+              m = re.search(attr + r'="([^"]+)"', tag, re.I)
+              if m:
+                  return m.group(1)
+
+              m = re.search(attr + r"='([^']+)'", tag, re.I)
+              if m:
+                  return m.group(1)
+
+              return None
+
           def read_text(rel):
               full = os.path.join(bin_dir, rel)
 
@@ -668,11 +682,12 @@ jobs:
 
           def rewrite_css(css, css_base=""):
               def replace_url(m):
-                  original = m.group(0)
-                  quote = m.group(1) or ""
-                  url = m.group(2).strip()
+                  raw = m.group(1).strip()
 
-                  rel = normalize_local(url, css_base)
+                  if len(raw) >= 2 and raw[0] in ("'", '"') and raw[-1] == raw[0]:
+                      raw = raw[1:-1]
+
+                  rel = normalize_local(raw, css_base)
 
                   if rel and rel in files:
                       mime = files[rel]["mime"]
@@ -681,21 +696,20 @@ jobs:
                           uri = data_uri(rel)
 
                           if uri:
-                              return f"url({quote}{uri}{quote})"
+                              return f"url({uri})"
 
-                  return original
+                  return m.group(0)
 
-              return re.sub(r"url\(([\"']?)([^\"']*)\1\)", replace_url, css, flags=re.I)
+              return re.sub(r"url\(([^)]+)\)", replace_url, css, flags=re.I)
 
           def replace_link(m):
               tag = m.group(0)
+              href = find_attr(tag, "href")
 
-              href_match = re.search(r"href=[\"']([^\"']+)[\"']", tag, re.I)
-
-              if not href_match:
+              if not href:
                   return tag
 
-              rel = normalize_local(href_match.group(1))
+              rel = normalize_local(href)
 
               if rel and rel in files and rel.lower().endswith(".css"):
                   css = read_text(rel)
@@ -704,7 +718,7 @@ jobs:
 
               return tag
 
-          html = re.sub(r"<link\b[^>]*rel=[\"']stylesheet[\"'][^>]*>", replace_link, html, flags=re.I)
+          html = re.sub(r"<link\b[^>]*stylesheet[^>]*>", replace_link, html, flags=re.I)
 
           def replace_style_block(m):
               attrs = m.group(1)
@@ -715,13 +729,12 @@ jobs:
 
           def replace_script(m):
               tag = m.group(0)
+              src = find_attr(tag, "src")
 
-              src_match = re.search(r"src=[\"']([^\"']+)[\"']", tag, re.I)
-
-              if not src_match:
+              if not src:
                   return tag
 
-              rel = normalize_local(src_match.group(1))
+              rel = normalize_local(src)
 
               if rel and rel in files and rel.lower().endswith(".js"):
                   js = read_text(rel)
@@ -732,7 +745,7 @@ jobs:
 
           html = re.sub(r"<script\b[^>]*\bsrc=[^>]*>\s*</script>", replace_script, html, flags=re.I | re.S)
 
-          def replace_media_attr(m):
+          def replace_media_attr_double(m):
               attr = m.group(1)
               url = m.group(2)
 
@@ -745,11 +758,29 @@ jobs:
                       uri = data_uri(rel)
 
                       if uri:
-                          return f"{attr}=\"{uri}\""
+                          return f'{attr}="{uri}"'
 
               return m.group(0)
 
-          html = re.sub(r"\b(src|poster)=[\"']([^\"']+)[\"']", replace_media_attr, html, flags=re.I)
+          def replace_media_attr_single(m):
+              attr = m.group(1)
+              url = m.group(2)
+
+              rel = normalize_local(url)
+
+              if rel and rel in files:
+                  info = files[rel]
+
+                  if info["mime"].startswith(("image/", "audio/", "video/", "font/")) and info["size"] < 5 * 1024 * 1024:
+                      uri = data_uri(rel)
+
+                      if uri:
+                          return f"{attr}='{uri}'"
+
+              return m.group(0)
+
+          html = re.sub(r'(src|poster)="([^"]+)"', replace_media_attr_double, html, flags=re.I)
+          html = re.sub(r"(src|poster)='([^']+)'", replace_media_attr_single, html, flags=re.I)
 
           client_files = {}
 
@@ -760,6 +791,7 @@ jobs:
               }
 
           files_json = json.dumps(client_files, separators=(",", ":"))
+          files_json = files_json.replace("</", "<\\/")
 
           loader_js = r'''
           (function() {
@@ -793,7 +825,7 @@ jobs:
             function lookup(path) {
               path = norm(path);
 
-              if (!path) {
+              if (!path || path.indexOf("://") !== -1 || path.indexOf("//") === 0) {
                 return null;
               }
 
@@ -997,7 +1029,7 @@ jobs:
 
       - name: Copy standalone HTML into repository root
         run: |
-          set -euo pipefail
+          set -eu
 
           OUTPUT_BASE="$(basename "$OUTPUT_FILE")"
 
@@ -1023,12 +1055,17 @@ jobs:
 
       - name: Commit standalone HTML to repository root
         run: |
-          set -euo pipefail
+          set -eu
 
           OUTPUT_BASE="$(basename "$OUTPUT_FILE")"
           BRANCH="${{ github.ref_name }}"
 
           cd host-repo
+
+          if [ ! -f "$OUTPUT_BASE" ]; then
+            echo "::error::$OUTPUT_BASE was not found."
+            exit 1
+          fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -1045,7 +1082,7 @@ jobs:
           SIZE="$(stat -c%s "$OUTPUT_BASE")"
 
           if [ "$SIZE" -gt 95000000 ]; then
-            echo "::error::$OUTPUT_BASE is larger than 95 MB. GitHub will usually reject commits over 100 MB."
+            echo "::error::$OUTPUT_BASE is larger than 95 MB and cannot be committed safely."
             echo "::error::Use the uploaded artifact instead, or reduce the mod/assets size."
             exit 1
           fi
