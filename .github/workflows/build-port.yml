@@ -1,0 +1,1054 @@
+name: Build FNF HTML5 Standalone
+
+on:
+  workflow_dispatch:
+    inputs:
+      mod_url:
+        description: "Direct download URL to your mod .zip file"
+        required: true
+        type: string
+
+      engine_repo:
+        description: "Engine repository to build"
+        required: false
+        default: "ShadowMario/FNF-PsychEngine"
+        type: string
+
+      engine_ref:
+        description: "Engine branch/tag"
+        required: false
+        default: "main"
+        type: string
+
+      output_file:
+        description: "Standalone HTML filename to commit to repository root"
+        required: false
+        default: "index.html"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      OUTPUT_FILE: ${{ inputs.output_file || 'index.html' }}
+      MAX_INLINE_FILE_MB: "25"
+      MAX_TOTAL_MB: "90"
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: host-repo
+
+      - name: Checkout engine source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.engine_repo }}
+          ref: ${{ inputs.engine_ref }}
+          path: engine-source
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl wget unzip zip file python3 python3-pip
+
+          # gdown is used for Google Drive links.
+          python3 -m pip install --quiet gdown \
+            || python3 -m pip install --quiet --break-system-packages gdown \
+            || python3 -m pip install --quiet --user --break-system-packages gdown
+
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download mod payload
+        run: |
+          set -euo pipefail
+
+          URL="${{ inputs.mod_url }}"
+          echo "::add-mask::$URL"
+
+          if echo "$URL" | grep -qi "drive.google.com"; then
+            echo "Downloading from Google Drive with gdown..."
+            gdown "$URL" -O mod.zip || gdown --fuzzy "$URL" -O mod.zip
+          else
+            FIXED_URL="$URL"
+
+            # Convert normal Dropbox page links into direct download links.
+            if echo "$FIXED_URL" | grep -qi "dropbox.com"; then
+              FIXED_URL=$(echo "$FIXED_URL" \
+                | sed -e 's/dl=0/dl=1/' \
+                -e 's/www\.dropbox\.com/dl.dropboxusercontent.com/')
+            fi
+
+            echo "Downloading direct zip..."
+            curl -L --fail --retry 3 --retry-delay 2 -o mod.zip "$FIXED_URL"
+          fi
+
+          file mod.zip || true
+
+          if ! unzip -tq mod.zip >/dev/null 2>&1; then
+            echo "::error::Downloaded file is not a valid zip archive."
+            exit 1
+          fi
+
+      - name: Extract and normalize mod payload
+        run: |
+          set -euo pipefail
+
+          mkdir -p payload_raw payload
+          unzip -q mod.zip -d payload_raw
+
+          rm -rf payload_raw/__MACOSX || true
+
+          shopt -s dotglob nullglob
+          entries=(payload_raw/*)
+
+          # If the zip contains one folder, flatten it.
+          if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
+            echo "Flattening single folder: ${entries[0]}"
+            mv "${entries[0]}"/* payload/ 2>/dev/null || true
+            mv "${entries[0]}"/.[!.]* payload/ 2>/dev/null || true
+          else
+            mv payload_raw/* payload/ 2>/dev/null || true
+          fi
+
+          rm -rf payload/__MACOSX payload/.git payload/.github || true
+
+          echo "Payload preview:"
+          find payload -maxdepth 2 -print | head -n 80
+
+      - name: Inject mod into engine
+        run: |
+          set -euo pipefail
+
+          cd engine-source
+          mkdir -p mods assets
+
+          shopt -s dotglob nullglob
+
+          # If the payload uses standard FNF/Psych folders, inject them directly.
+          if [ -d ../payload/mods ]; then
+            echo "Injecting payload/mods..."
+            cp -rn ../payload/mods/. mods/ || true
+            cp -rn ../payload/mods/. assets/ || true
+          fi
+
+          if [ -d ../payload/assets ]; then
+            echo "Injecting payload/assets..."
+            cp -rn ../payload/assets/. assets/ || true
+            cp -rn ../payload/assets/. mods/ || true
+          fi
+
+          # Copy top-level files/folders that are not mods/assets into both locations.
+          for item in ../payload/*; do
+            base="$(basename "$item")"
+
+            if [ "$base" = "mods" ] || [ "$base" = "assets" ]; then
+              continue
+            fi
+
+            echo "Injecting extra payload item: $base"
+            cp -rn "$item" mods/ || true
+            cp -rn "$item" assets/ || true
+          done
+
+          # If payload had no recognizable structure, the above loop already copied it.
+          echo "Injected payload preview:"
+          find mods -maxdepth 2 -print | head -n 40
+          find assets -maxdepth 2 -print | head -n 40
+
+      - name: Setup Haxe
+        uses: krdlab/setup-haxe@v1
+        with:
+          haxe-version: "4.2.5"
+
+      - name: Install Haxelibs
+        run: |
+          set -euo pipefail
+
+          cd engine-source
+
+          haxelib setup ~/haxelib
+          haxelib install hmm --always --quiet
+
+          # Prefer the engine's own dependency lockfile if present.
+          haxelib run hmm install --quiet || true
+
+          # Fallbacks for common required libs if hmm did not provide them.
+          for lib in lime openfl flixel flixel-addons flixel-ui flixel-tools hscript hxcpp; do
+            if ! haxelib list | grep -q "^$lib:"; then
+              echo "Installing fallback lib: $lib"
+              haxelib install "$lib" --always --quiet || true
+            fi
+          done
+
+          haxelib list
+
+      - name: Patch engine for HTML5/web build
+        run: |
+          set -euo pipefail
+
+          cd engine-source
+
+          mkdir -p source/webmock
+          mkdir -p source/hxdiscord_rpc
+
+          cat > source/webmock/FileSystem.hx <<'HX'
+          package webmock;
+
+          class FileSystem
+          {
+            public static function absolutePath(path:String):String
+            {
+              return path;
+            }
+
+            public static function exists(path:String):Bool
+            {
+              return false;
+            }
+
+            public static function readDirectory(path:String):Array<String>
+            {
+              return [];
+            }
+
+            public static function isDirectory(path:String):Bool
+            {
+              return false;
+            }
+
+            public static function stat(path:String):Dynamic
+            {
+              return null;
+            }
+
+            public static function fullPath(path:String):String
+            {
+              return path;
+            }
+
+            public static function createDirectory(path:String):Void
+            {
+            }
+
+            public static function deleteFile(path:String):Void
+            {
+            }
+
+            public static function deleteDirectory(path:String):Void
+            {
+            }
+          }
+          HX
+
+          cat > source/webmock/File.hx <<'HX'
+          package webmock;
+
+          import haxe.io.Bytes;
+
+          class File
+          {
+            public static function getContent(path:String):String
+            {
+              return "";
+            }
+
+            public static function getBytes(path:String):Bytes
+            {
+              return null;
+            }
+
+            public static function saveContent(path:String, content:String):Void
+            {
+            }
+
+            public static function saveBytes(path:String, bytes:Bytes):Void
+            {
+            }
+
+            public static function copy(source:String, destination:String):Void
+            {
+            }
+          }
+          HX
+
+          cat > source/webmock/Sys.hx <<'HX'
+          package webmock;
+
+          class Sys
+          {
+            public static function exit(code:Int):Void
+            {
+            }
+
+            public static function sleep(t:Float):Void
+            {
+            }
+
+            public static function command(cmd:String, ?args:Array<String>):Int
+            {
+              return 0;
+            }
+
+            public static function args():Array<String>
+            {
+              return [];
+            }
+
+            public static function getCwd():String
+            {
+              return "";
+            }
+
+            public static function setCwd(cwd:String):Void
+            {
+            }
+
+            public static function print(v:Dynamic):Void
+            {
+            }
+
+            public static function println(v:Dynamic):Void
+            {
+            }
+
+            public static function environment():haxe.ds.StringMap<String>
+            {
+              return new haxe.ds.StringMap<String>();
+            }
+
+            public static function getEnv(name:String):String
+            {
+              return "";
+            }
+
+            public static function putEnv(name:String, value:String):Void
+            {
+            }
+
+            public static function programPath():String
+            {
+              return "";
+            }
+
+            public static function executablePath():String
+            {
+              return "";
+            }
+
+            public static function systemName():String
+            {
+              return "Web";
+            }
+
+            public static function time():Float
+            {
+              return 0;
+            }
+
+            public static function cpuTime():Float
+            {
+              return 0;
+            }
+          }
+          HX
+
+          cat > source/webmock/Process.hx <<'HX'
+          package webmock;
+
+          class Process
+          {
+            public var stdout:Dynamic;
+            public var stderr:Dynamic;
+
+            public function new(cmd:String, ?args:Array<String>)
+            {
+              stdout = {
+                readAll: function():String
+                {
+                  return "";
+                },
+                readLine: function():String
+                {
+                  return "";
+                }
+              };
+
+              stderr = stdout;
+            }
+
+            public function exitCode(block:Bool = true):Int
+            {
+              return 0;
+            }
+
+            public function close():Void
+            {
+            }
+
+            public function kill():Void
+            {
+            }
+          }
+          HX
+
+          cat > source/webmock/Thread.hx <<'HX'
+          package webmock;
+
+          class Thread
+          {
+            public function new()
+            {
+            }
+
+            public static function create(f:Void->Void):Thread
+            {
+              f();
+              return new Thread();
+            }
+
+            public static function readMessage(block:Bool):Dynamic
+            {
+              return null;
+            }
+
+            public static function sendMessage(message:Dynamic):Void
+            {
+            }
+          }
+          HX
+
+          cat > source/webmock/Mutex.hx <<'HX'
+          package webmock;
+
+          class Mutex
+          {
+            public function new()
+            {
+            }
+
+            public function acquire():Void
+            {
+            }
+
+            public function release():Void
+            {
+            }
+          }
+          HX
+
+          cat > source/hxdiscord_rpc/Discord.hx <<'HX'
+          package hxdiscord_rpc;
+
+          class Discord
+          {
+            public static function Initialize(clientId:String, autoRegister:Bool, steamId:Dynamic):Bool
+            {
+              return false;
+            }
+
+            public static function Shutdown():Void
+            {
+            }
+
+            public static function RunCallbacks():Void
+            {
+            }
+
+            public static function UpdatePresence(presence:Dynamic):Void
+            {
+            }
+
+            public static function ClearPresence():Void
+            {
+            }
+          }
+          HX
+
+          cat > source/hxdiscord_rpc/Types.hx <<'HX'
+          package hxdiscord_rpc;
+
+          class Types
+          {
+            public static inline var DISCORD_REPLY_NO:Int = 0;
+            public static inline var DISCORD_REPLY_YES:Int = 1;
+            public static inline var DISCORD_REPLY_IGNORE:Int = 2;
+          }
+          HX
+
+          cat > source/hxdiscord_rpc/DiscordPresence.hx <<'HX'
+          package hxdiscord_rpc;
+
+          typedef DiscordPresence = Dynamic;
+          HX
+
+          # Remove desktop/native-only libraries from the project file.
+          if [ -f Project.xml ]; then
+            sed -i \
+              -e '/discord_rpc/d' \
+              -e '/discord-rpc/d' \
+              -e '/linc_luajit/d' \
+              -e '/hxcodec/d' \
+              Project.xml || true
+          fi
+
+          # Patch common desktop/sys/native references to web-safe mocks.
+          if [ -d source ]; then
+            find source -name "*.hx" -type f -print0 | xargs -0 sed -i \
+              -e 's/sys\.FileSystem/webmock.FileSystem/g' \
+              -e 's/sys\.io\.File/webmock.File/g' \
+              -e 's/sys\.io\.Process/webmock.Process/g' \
+              -e 's/sys\.thread\.Thread/webmock.Thread/g' \
+              -e 's/sys\.thread\.Mutex/webmock.Mutex/g' \
+              -e 's/\bSys\./webmock.Sys./g' \
+              -e '/import Sys;/d' \
+              -e '/import cpp/d' \
+              -e 's/cpp\.[A-Za-z0-9_\.]+/Dynamic/g' \
+              -e '/import llua/d' \
+              -e 's/llua\.[A-Za-z0-9_\.]+/Dynamic/g' \
+              || true
+          fi
+
+      - name: Build HTML5
+        run: |
+          set -euo pipefail
+
+          cd engine-source
+
+          haxelib run lime build html5 -release \
+            -D web \
+            -D DISCORD_DISABLE \
+            -D NO_PRELOAD_ALL \
+            -D NO_LUA \
+            -D NO_VIDEO
+
+      - name: Verify HTML5 build output
+        run: |
+          set -euo pipefail
+
+          BIN_DIR="engine-source/export/release/html5/bin"
+
+          if [ ! -d "$BIN_DIR" ]; then
+            echo "::error::HTML5 build output was not found at $BIN_DIR"
+            exit 1
+          fi
+
+          echo "Build output preview:"
+          ls -la "$BIN_DIR" | head -n 80
+
+      - name: Generate standalone HTML
+        run: |
+          set -euo pipefail
+
+          cat > inline_html.py <<'PY'
+          import base64
+          import json
+          import mimetypes
+          import os
+          import posixpath
+          import re
+          import sys
+          from urllib.parse import unquote
+
+          bin_dir = sys.argv[1]
+          out_path = sys.argv[2]
+
+          max_file_mb = float(os.environ.get("MAX_INLINE_FILE_MB", "25"))
+          max_total_mb = float(os.environ.get("MAX_TOTAL_MB", "90"))
+
+          files = {}
+          total_bytes = 0
+
+          def rel_path(full):
+              return os.path.relpath(full, bin_dir).replace(os.sep, "/")
+
+          for root, dirs, names in os.walk(bin_dir):
+              for name in names:
+                  full = os.path.join(root, name)
+                  rel = rel_path(full)
+
+                  if rel == "index.html":
+                      continue
+
+                  size = os.path.getsize(full)
+
+                  if size > max_file_mb * 1024 * 1024:
+                      print(f"::warning::Skipping embed of {rel}: {size / 1048576:.1f} MB exceeds MAX_INLINE_FILE_MB")
+                      continue
+
+                  mime = mimetypes.guess_type(full)[0] or "application/octet-stream"
+
+                  with open(full, "rb") as fh:
+                      data = base64.b64encode(fh.read()).decode("ascii")
+
+                  files[rel] = {
+                      "mime": mime,
+                      "data": data,
+                      "size": size,
+                  }
+
+                  total_bytes += size
+
+                  if total_bytes > max_total_mb * 1024 * 1024:
+                      print(f"::warning::Embedded payload is over {max_total_mb} MB. Git commit may fail.")
+
+          index_path = os.path.join(bin_dir, "index.html")
+
+          if os.path.exists(index_path):
+              with open(index_path, "r", encoding="utf-8", errors="ignore") as fh:
+                  html = fh.read()
+          else:
+              html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><script src=\"funkin.js\"></script></body></html>"
+
+          def clean_url(url):
+              url = url.strip()
+              url = url.split("?")[0]
+              url = url.split("#")[0]
+              url = unquote(url)
+              return url
+
+          def normalize_local(url, base=""):
+              if not url:
+                  return None
+
+              url = clean_url(url)
+
+              if url.startswith("data:"):
+                  return None
+
+              if url.startswith("blob:"):
+                  return None
+
+              if url.startswith("javascript:"):
+                  return None
+
+              if url.startswith("mailto:"):
+                  return None
+
+              if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+                  return None
+
+              if url.startswith("//"):
+                  return None
+
+              if url.startswith("/"):
+                  path = url.lstrip("/")
+              else:
+                  path = posixpath.join(base, url) if base else url
+
+              path = posixpath.normpath(path)
+
+              if path.startswith("../"):
+                  return None
+
+              return path
+
+          def read_text(rel):
+              full = os.path.join(bin_dir, rel)
+
+              if not os.path.exists(full):
+                  return ""
+
+              with open(full, "r", encoding="utf-8", errors="ignore") as fh:
+                  return fh.read()
+
+          def data_uri(rel):
+              info = files.get(rel)
+
+              if not info:
+                  return None
+
+              return f"data:{info['mime']};base64,{info['data']}"
+
+          def rewrite_css(css, css_base=""):
+              def replace_url(m):
+                  original = m.group(0)
+                  quote = m.group(1) or ""
+                  url = m.group(2).strip()
+
+                  rel = normalize_local(url, css_base)
+
+                  if rel and rel in files:
+                      mime = files[rel]["mime"]
+
+                      if mime.startswith(("image/", "font/", "application/octet-stream", "text/css", "application/javascript")):
+                          uri = data_uri(rel)
+
+                          if uri:
+                              return f"url({quote}{uri}{quote})"
+
+                  return original
+
+              return re.sub(r"url\(([\"']?)([^\"']*)\1\)", replace_url, css, flags=re.I)
+
+          def replace_link(m):
+              tag = m.group(0)
+
+              href_match = re.search(r"href=[\"']([^\"']+)[\"']", tag, re.I)
+
+              if not href_match:
+                  return tag
+
+              rel = normalize_local(href_match.group(1))
+
+              if rel and rel in files and rel.lower().endswith(".css"):
+                  css = read_text(rel)
+                  css = rewrite_css(css, posixpath.dirname(rel))
+                  return f"<style>\n{css}\n</style>"
+
+              return tag
+
+          html = re.sub(r"<link\b[^>]*rel=[\"']stylesheet[\"'][^>]*>", replace_link, html, flags=re.I)
+
+          def replace_style_block(m):
+              attrs = m.group(1)
+              css = m.group(2)
+              return f"<style{attrs}>\n{rewrite_css(css)}\n</style>"
+
+          html = re.sub(r"<style([^>]*)>(.*?)</style>", replace_style_block, html, flags=re.I | re.S)
+
+          def replace_script(m):
+              tag = m.group(0)
+
+              src_match = re.search(r"src=[\"']([^\"']+)[\"']", tag, re.I)
+
+              if not src_match:
+                  return tag
+
+              rel = normalize_local(src_match.group(1))
+
+              if rel and rel in files and rel.lower().endswith(".js"):
+                  js = read_text(rel)
+                  js = js.replace("</script", "<\\/script")
+                  return f"<script>\n{js}\n</script>"
+
+              return tag
+
+          html = re.sub(r"<script\b[^>]*\bsrc=[^>]*>\s*</script>", replace_script, html, flags=re.I | re.S)
+
+          def replace_media_attr(m):
+              attr = m.group(1)
+              url = m.group(2)
+
+              rel = normalize_local(url)
+
+              if rel and rel in files:
+                  info = files[rel]
+
+                  if info["mime"].startswith(("image/", "audio/", "video/", "font/")) and info["size"] < 5 * 1024 * 1024:
+                      uri = data_uri(rel)
+
+                      if uri:
+                          return f"{attr}=\"{uri}\""
+
+              return m.group(0)
+
+          html = re.sub(r"\b(src|poster)=[\"']([^\"']+)[\"']", replace_media_attr, html, flags=re.I)
+
+          client_files = {}
+
+          for rel, info in files.items():
+              client_files[rel] = {
+                  "mime": info["mime"],
+                  "data": info["data"],
+              }
+
+          files_json = json.dumps(client_files, separators=(",", ":"))
+
+          loader_js = r'''
+          (function() {
+            const FILES = __FILES__;
+            const blobCache = new Map();
+            const urlCache = new Map();
+
+            function norm(u) {
+              if (typeof u !== "string") {
+                return "";
+              }
+
+              let parsed;
+
+              try {
+                parsed = new URL(u, location.href);
+              } catch(e) {
+                return String(u).replace(/^\.\//, "").split(/[?#]/)[0];
+              }
+
+              if (parsed.protocol && parsed.protocol.startsWith("http") && location.protocol && parsed.origin !== location.origin) {
+                return u;
+              }
+
+              let p = decodeURIComponent(parsed.pathname || "");
+              p = p.replace(/^\/+/, "").replace(/^\.\//, "");
+
+              return p.split(/[?#]/)[0];
+            }
+
+            function lookup(path) {
+              path = norm(path);
+
+              if (!path) {
+                return null;
+              }
+
+              if (FILES[path]) {
+                return { key: path, info: FILES[path] };
+              }
+
+              const parts = path.split("/");
+
+              while (parts.length > 1) {
+                parts.shift();
+
+                const alt = parts.join("/");
+
+                if (FILES[alt]) {
+                  return { key: alt, info: FILES[alt] };
+                }
+              }
+
+              return null;
+            }
+
+            function b64ToUint8(b64) {
+              const bin = atob(b64);
+              const len = bin.length;
+              const arr = new Uint8Array(len);
+
+              for (let i = 0; i < len; i++) {
+                arr[i] = bin.charCodeAt(i);
+              }
+
+              return arr;
+            }
+
+            function blobFor(path) {
+              const found = lookup(path);
+
+              if (!found) {
+                return null;
+              }
+
+              if (!blobCache.has(found.key)) {
+                blobCache.set(
+                  found.key,
+                  new Blob(
+                    [b64ToUint8(found.info.data)],
+                    { type: found.info.mime || "application/octet-stream" }
+                  )
+                );
+              }
+
+              return blobCache.get(found.key);
+            }
+
+            function objectUrlFor(path) {
+              const found = lookup(path);
+
+              if (!found) {
+                return null;
+              }
+
+              if (!urlCache.has(found.key)) {
+                const blob = blobFor(found.key);
+
+                if (!blob) {
+                  return null;
+                }
+
+                urlCache.set(found.key, URL.createObjectURL(blob));
+              }
+
+              return urlCache.get(found.key);
+            }
+
+            const origFetch = window.fetch;
+
+            if (origFetch) {
+              window.fetch = function(input, init) {
+                let url = typeof input === "string" ? input : (input && input.url);
+                const found = lookup(url);
+
+                if (found) {
+                  const blob = blobFor(found.key);
+
+                  return Promise.resolve(new Response(blob, {
+                    status: 200,
+                    statusText: "OK",
+                    headers: {
+                      "Content-Type": found.info.mime || "application/octet-stream"
+                    }
+                  }));
+                }
+
+                return origFetch.apply(this, arguments);
+              };
+            }
+
+            const XHR = window.XMLHttpRequest;
+
+            if (XHR && XHR.prototype && XHR.prototype.open) {
+              const origOpen = XHR.prototype.open;
+
+              XHR.prototype.open = function() {
+                const args = Array.prototype.slice.call(arguments);
+
+                if (args.length >= 2) {
+                  const found = lookup(args[1]);
+
+                  if (found) {
+                    args[1] = objectUrlFor(found.key);
+                  }
+                }
+
+                return origOpen.apply(this, args);
+              };
+            }
+
+            function patchSrc(proto) {
+              if (!proto) {
+                return;
+              }
+
+              const desc = Object.getOwnPropertyDescriptor(proto, "src");
+
+              if (!desc || !desc.set || !desc.get) {
+                return;
+              }
+
+              Object.defineProperty(proto, "src", {
+                configurable: true,
+                enumerable: true,
+                get: function() {
+                  return desc.get.call(this);
+                },
+                set: function(v) {
+                  const found = lookup(v);
+
+                  if (found) {
+                    v = objectUrlFor(found.key);
+                  }
+
+                  desc.set.call(this, v);
+                }
+              });
+            }
+
+            if (window.HTMLImageElement) {
+              patchSrc(HTMLImageElement.prototype);
+            }
+
+            if (window.HTMLAudioElement) {
+              patchSrc(HTMLAudioElement.prototype);
+            }
+
+            if (window.HTMLVideoElement) {
+              patchSrc(HTMLVideoElement.prototype);
+            }
+
+            const OrigWorker = window.Worker;
+
+            if (OrigWorker) {
+              window.Worker = function(url, options) {
+                const found = lookup(url);
+
+                if (found) {
+                  url = objectUrlFor(found.key);
+                }
+
+                return new OrigWorker(url, options);
+              };
+
+              window.Worker.prototype = OrigWorker.prototype;
+            }
+          })();
+          '''
+
+          loader_js = loader_js.replace("__FILES__", files_json)
+          loader = f"<script id=\"standalone-embed-loader\">\n{loader_js}\n</script>"
+
+          if re.search(r"<head[^>]*>", html, flags=re.I):
+              def insert_after_head(m):
+                  return m.group(1) + "\n" + loader
+
+              html = re.sub(r"(<head[^>]*>)", insert_after_head, html, count=1, flags=re.I)
+          else:
+              parts = re.split(r"(<script\b)", html, maxsplit=1, flags=re.I)
+
+              if len(parts) == 3:
+                  html = parts[0] + loader + parts[1] + parts[2]
+              else:
+                  html = loader + html
+
+          with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+              fh.write(html)
+
+          size = os.path.getsize(out_path)
+          print(f"Created {out_path}: {size / 1048576:.2f} MB")
+          PY
+
+          python3 inline_html.py "engine-source/export/release/html5/bin" "standalone.generated.html"
+
+      - name: Copy standalone HTML into repository root
+        run: |
+          set -euo pipefail
+
+          OUTPUT_BASE="$(basename "$OUTPUT_FILE")"
+
+          cp standalone.generated.html "host-repo/$OUTPUT_BASE"
+
+          echo "Prepared root file: host-repo/$OUTPUT_BASE"
+
+      - name: Upload standalone HTML artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-html
+          path: standalone.generated.html
+          if-no-files-found: ignore
+
+      - name: Upload full web export artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-export
+          path: engine-source/export/release/html5/bin
+          if-no-files-found: ignore
+
+      - name: Commit standalone HTML to repository root
+        run: |
+          set -euo pipefail
+
+          OUTPUT_BASE="$(basename "$OUTPUT_FILE")"
+          BRANCH="${{ github.ref_name }}"
+
+          cd host-repo
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B "$BRANCH" || true
+
+          git add "$OUTPUT_BASE"
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          SIZE="$(stat -c%s "$OUTPUT_BASE")"
+
+          if [ "$SIZE" -gt 95000000 ]; then
+            echo "::error::$OUTPUT_BASE is larger than 95 MB. GitHub will usually reject commits over 100 MB."
+            echo "::error::Use the uploaded artifact instead, or reduce the mod/assets size."
+            exit 1
+          fi
+
+          git commit -m "Automated FNF HTML5 standalone build"
+          git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:"$BRANCH"
